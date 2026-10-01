@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -243,26 +243,68 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    def __init__(self, max_output_tokens: int = 1_000) -> None:
+        gemini_keys = [
+            os.getenv(name, "").strip()
+            for name in (
+                "GEMINI_API_KEY",
+                "GEMINI_API_KEY_2",
+                "GEMINI_API_KEY_3",
+                "GEMINI_API_KEY_4",
+                "GEMINI_API_KEY_5",
+            )
+        ]
+        api_keys = list(dict.fromkeys(key for key in gemini_keys if key))
+        if not api_keys:
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if openai_key:
+                api_keys = [openai_key]
         self.model = os.getenv("OPENAI_MODEL", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
+        self.base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+        if not api_keys:
+            raise RuntimeError("GEMINI_API_KEY or OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        self.clients: list[OpenAI] = []
+        for api_key in api_keys:
+            client_options: dict[str, str] = {"api_key": api_key}
+            if self.base_url:
+                client_options["base_url"] = self.base_url
+            self.clients.append(OpenAI(**client_options))
+        self.client_index = 0
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        if self.base_url:
+            last_error: RateLimitError | None = None
+            for offset in range(len(self.clients)):
+                index = (self.client_index + offset) % len(self.clients)
+                try:
+                    response = self.clients[index].chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        reasoning_effort="low",
+                        max_tokens=self.max_output_tokens,
+                    )
+                    self.client_index = index
+                    break
+                except RateLimitError as exc:
+                    last_error = exc
+            else:
+                assert last_error is not None
+                raise last_error
+            answer = (response.choices[0].message.content or "").strip()
+        else:
+            response = self.clients[0].responses.create(
+                model=self.model,
+                input=prompt,
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            )
+            answer = response.output_text.strip()
         if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
+            raise RuntimeError("The model returned an empty answer")
         return answer
 
 
